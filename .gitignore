@@ -1,0 +1,16 @@
+__pycache__/
+data/
+signalp/
+sav/
+sav28-10/
+microbializer_prod/
+effectidor_env/
+
+Effectidor-OGs/
+auxiliaries/
+
+*.tar.gz
+*.out
+*.err
+*.log
+*.txt
