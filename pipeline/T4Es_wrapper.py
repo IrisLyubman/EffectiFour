@@ -66,7 +66,7 @@ def create_effectors_html(effectors_file,ORFs_file,out_dir):
     data = pd.read_csv(f'{out_dir}/effectors_for_html.csv')
     effectors_table = data.to_html(index=False,justify='left',escape=False)
     return effectors_table,None,None, False
-            
+
 def write_sh_file(tmp_dir, path_to_fasta, path_for_output_csv, queue='pupko-pool'):
     cmds = [
         'export HOME=/groups/pupko/irislyubman/secretion_signal_type4b/',
@@ -91,6 +91,46 @@ def write_sh_file(tmp_dir, path_to_fasta, path_for_output_csv, queue='pupko-pool
     content = '!@#'.join(cmds) + '\tEffectidor_embedding'
 
     with open(f'{tmp_dir}/Embedding.cmds', 'w') as out:
+        out.write(content)
+
+
+def write_gnlp_sh_file(tmp_dir, path_to_fasta, working_directory):
+    """
+    Create a separate GeNLP job that uses Iris's GeNLP conda environment
+    and writes all generated files into the current EffectiFour run directory.
+    """
+    gnlp_root = '/groups/pupko/irislyubman/gnlp'
+    gnlp_env = '/groups/pupko/irislyubman/.conda/envs/gnlp'
+    gnlp_script = f'{gnlp_root}/scripts/run_gnlp_feature.py'
+    gnlp_database = f'{gnlp_root}/results/T4Es_db_embeddings.csv'
+
+    output_csv = os.path.join(working_directory, 'gnlp_features.csv')
+    gnlp_workdir = os.path.join(working_directory, 'gnlp_tmp')
+
+    cmds = [
+        f'export HOME={gnlp_root}',
+        'echo "Starting GeNLP feature job"',
+        'echo "Job ID: $SLURM_JOB_ID"',
+        'echo "Running on nodes: $SLURM_JOB_NODELIST"',
+        'echo "Allocated CPUs: $SLURM_JOB_CPUS_PER_NODE"',
+        'module load miniconda',
+        'eval "$(conda shell.bash hook)"',
+        f'conda activate {gnlp_env}',
+        'export PATH=$CONDA_PREFIX/bin:$PATH',
+        'which python',
+        'echo "CONDA_PREFIX=$CONDA_PREFIX"',
+        f'python {gnlp_script} '
+        f'--input {path_to_fasta} '
+        f'--output {output_csv} '
+        f'--database {gnlp_database} '
+        f'--workdir {gnlp_workdir}',
+        f'touch {output_csv}.done',
+        f'touch {os.path.join(tmp_dir, "gnlp_features.csv.done")}'
+    ]
+
+    content = '!@#'.join(cmds) + '\tEffectidor_GeNLP'
+
+    with open(os.path.join(tmp_dir, 'GeNLP.cmds'), 'w') as out:
         out.write(content)
 
 def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tmp_dir, queue, gff_file, full_genome_f,
@@ -129,14 +169,19 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
     subprocess.check_output(cmd, shell=True)
 
     blast_datasets_dir = f'{working_directory}/blast_data'
-            
+
     # feature extraction step
-    
+
     # translate the input fasta files
     subprocess.check_output(['python',f'{scripts_dir}/translate_fasta.py',ORFs_file,effectors_file,all_prots,effectors_prots])
 
+    # GeNLP is a default feature: it only needs the translated proteome.
+    # The GeNLP job itself runs in Iris's dedicated conda environment.
+    gnlp_input_fasta = os.path.join(working_directory, all_prots)
+    write_gnlp_sh_file(tmp_dir, gnlp_input_fasta, working_directory)
+
     logger.info(f'effectors_learn: signalp = {signalp}')
-    
+
     if signal: #make C-terminal sequences for Signal search
         #os.makedirs(signal_prot_dir, exist_ok=True)
         recs = SeqIO.parse(all_prots,'fasta')
@@ -150,7 +195,7 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
         C_terminal_file_path = os.path.join(working_directory, 'C_terminals.faa')
         SeqIO.write(C_terminals, C_terminal_file_path, 'fasta')
         write_sh_file(tmp_dir, C_terminal_file_path, f'{working_directory}/Embedding_pred.csv')
-    
+
     if not effectors_file:
         subprocess.check_output(['python', f'{scripts_dir}/find_effectors.py', f'{blast_datasets_dir}/T4Es.faa', all_prots, effectors_prots, coverage])
     elif homology_search:
@@ -164,7 +209,7 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
     if len(list(T4Es_recs))>400:
         error_msg = 'the number of effectors found based on homology exceeds the number of expected T4Es in a single genome! If you included T4Es for homology search, make sure they contain nothing but true T4Es.'
         fail(error_msg, error_path)
-        
+
     # find and create non effectors fasta file
     subprocess.check_output(['python', f'{scripts_dir}/find_non_effectors.py', all_prots, effectors_prots])
     subprocess.check_output(['python', f'{scripts_dir}/find_T4SS_components.py', working_directory, all_prots, 'T4SS_data'])
@@ -209,15 +254,19 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
             subprocess.call(f'python {os.path.join(scripts_dir, "auxiliaries", "q_submitter_power.py")} --cpu 3 {working_directory}/signalp.cmds {tmp_dir} -q {queue}', shell=True)
     if not os.path.exists(f'{working_directory}/physical_features.done'):
         subprocess.call(f'python {os.path.join(scripts_dir, "auxiliaries", "q_submitter_power.py")} {working_directory}/features_jobs.cmds {tmp_dir} -q {queue} --memory 4', shell=True)
-    
+
+    # GeNLP (always submitted)
+    if not os.path.exists(os.path.join(working_directory, 'gnlp_features.csv.done')):
+        cmd = f'python {os.path.join(scripts_dir, "auxiliaries", "q_submitter_power.py")} {os.path.join(tmp_dir, "GeNLP.cmds")} {tmp_dir} -q {queue} --cpu 4 --memory 8'
+        subprocess.call(cmd, shell=True)
+
     if signal:
         if not os.path.exists(f'{working_directory}/Embedding_pred.csv.done'):
             cmd = f'python {os.path.join(scripts_dir, "auxiliaries", "q_submitter_power.py")} {os.path.join(tmp_dir,"Embedding.cmds")} {tmp_dir} -q {queue} --cpu 10 --memory 15'
             subprocess.call(cmd, shell=True)
     create_annotations_f(ORFs_file, gff_file, 'annotations.csv', 'pseudogenes.txt')
     x = sum([item.endswith('done') for item in os.listdir(working_directory)])
-    # amount_of_expected_results = 3
-    amount_of_expected_results = 2
+    amount_of_expected_results = 3  # physical + homology + GeNLP
     if signal:
         amount_of_expected_results += 1
     if signalp:
@@ -228,7 +277,7 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
             amount_of_expected_results += 1
         if full_genome_f:
             amount_of_expected_results += 1
-            
+
     while x < amount_of_expected_results:
         print('number of expected outputs is '+str(amount_of_expected_results)+' , number of existing outputs is '+str(x)+', waiting for additional '+str(amount_of_expected_results-x)+' outputs')
         time.sleep(60)
@@ -236,7 +285,7 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
         x = sum([item.endswith('done') for item in os.listdir(working_directory)])
         if x < num_finished_jobs:
             break
-        
+
     effectors = SeqIO.to_dict(SeqIO.parse(effectors_prots, 'fasta')).keys()
     non_effectors = SeqIO.to_dict(SeqIO.parse('non_effectors.faa', 'fasta')).keys()
     all_loci = SeqIO.to_dict(SeqIO.parse(all_prots, 'fasta')).keys()
@@ -249,11 +298,11 @@ def effectors_learn(error_path, ORFs_file, effectors_file, working_directory, tm
         else:
             label_dict[locus] = [locus, '?']
     label_df = pd.DataFrame.from_dict(label_dict, orient='index', columns=['locus', 'is_effector'])
-    
+
     # files_to_merge =['physical_features.csv', 'homology_features.csv', 'signal_p_features.csv']
     # done_files = ['physical_features.done', 'homology_features.done', 'signal_p_features.done']
-    files_to_merge = ['physical_features.csv', 'homology_features.csv']
-    done_files = ['physical_features.done', 'homology_features.done']
+    files_to_merge = ['physical_features.csv', 'homology_features.csv', 'gnlp_features.csv']
+    done_files = ['physical_features.done', 'homology_features.done', 'gnlp_features.csv.done']
     if signalp:
         files_to_merge.append('signal_p_features.csv')
         done_files.append('signal_p_features.done')

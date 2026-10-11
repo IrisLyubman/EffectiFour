@@ -18,7 +18,7 @@ def parse_gff(gff_f, locus_dic):
         for line in in_f:
             if line.startswith('#'): #header
                 continue
-            
+
             line_l = line.strip().split('\t')
             if len(line_l) > 2:
                 if line_l[2] == 'CDS':
@@ -79,7 +79,7 @@ def parse_gff_to_CDS_loc(gff_f, locus_dic):
                 line_l = line.split()
                 if 'sequence-region' in line_l[0]:
                     regions.append(line_l[1])
-                    locus_area_d[line_l[1]] = {}            
+                    locus_area_d[line_l[1]] = {}
             line_l = line.strip().split('\t')
             if len(line_l) > 2:
                 if line_l[2] == 'region' or line_l[2] == "chromosome" or line_l[2] == "plasmid":
@@ -152,6 +152,76 @@ def get_promoters(gene_area_dic, circular_contigs, genome_f, promoter_length=150
             promoters_d[gene] = promoter
     return promoters_d
 
+def get_regions_around_ORF_start(gene_area_dic, circular_contigs, genome_f,
+                                 upstream_length=100, downstream_length=50):
+    regions_d = {}
+    genome = SeqIO.to_dict(SeqIO.parse(genome_f, 'fasta'))
+
+    def circular_slice(seq, start, length):
+        """Extract a sequence of given length from a circular contig."""
+        n = len(seq)
+        start = start % n
+
+        if start + length <= n:
+            return seq[start:start + length]
+        else:
+            first_part = seq[start:]
+            remaining = length - len(first_part)
+            return first_part + seq[:remaining]
+
+    for region_dic in gene_area_dic:
+        seq = genome[region_dic].seq
+        seq_len = len(seq)
+
+        for gene in gene_area_dic[region_dic]:
+            start, end = gene_area_dic[region_dic][gene][0]
+            strand = gene_area_dic[region_dic][gene][1]
+
+            if strand == 1:
+                # Forward strand:
+                # 100 nt before ORF start + 50 nt inside ORF
+                region_start = start - upstream_length
+                total_length = upstream_length + downstream_length
+
+                if region_dic in circular_contigs:
+                    region = circular_slice(
+                        seq,
+                        region_start,
+                        total_length
+                    )
+                else:
+                    region = seq[
+                        max(0, region_start):
+                        min(seq_len, start + downstream_length)
+                    ]
+
+            else:
+                # Reverse strand:
+                # ORF starts at the genomic "end" coordinate.
+                #
+                # Genomic interval:
+                # 50 nt inside ORF + 100 nt upstream
+                region_start = end - downstream_length
+                total_length = upstream_length + downstream_length
+
+                if region_dic in circular_contigs:
+                    region = circular_slice(
+                        seq,
+                        region_start,
+                        total_length
+                    )
+                else:
+                    region = seq[
+                        max(0, end - downstream_length):
+                        min(seq_len, end + upstream_length)
+                    ]
+
+                # Put sequence in transcriptional orientation
+                region = region.reverse_complement()
+
+            regions_d[gene] = region
+
+    return regions_d
 
 def create_box_mismatches(box_list, num_mismatches=2):
     motifs = []
@@ -163,6 +233,7 @@ def create_box_mismatches(box_list, num_mismatches=2):
 
     return '|'.join(motifs)
 
+# Not relevant in type IV
 exs_box = '[AT]{3}[AC][AT]{2}[AC]{3}C[GT][GTA]CC[GA]A[AT][ATC][CT]TG[GA][TC]A'
 exs_box_l = ['[AT]']*3+['[AC]']+['[AT]']*2+['[AC]']*3+['C', '[GT]', '[GTA]']+['C']*2+['[GA]', 'A', '[AT]', '[ATC]', '[CT]', 'T', 'G', '[GA]', '[TC]', 'A']
 exs_box_mismatch = create_box_mismatches(exs_box_l)
@@ -173,14 +244,15 @@ cpxr = 'GTAAA[ATGC]{6}G[AT]AAA'
 cpxr_l = ['G','T','A','A','A'] + ['[ATGC]']*6 + ['G','[AT]','A','A','A']
 cpxr_mismatch = create_box_mismatches(cpxr_l, num_mismatches=1)
 
-pmra = 'CTTAA[TG][AG][TC]T[ATGC]{2}[ACG]TTAA[TG][ATG][ATC][TA]'
-pmra_l = (list("CTTAA") + ['[TG]', '[AG]', '[TC]'] + list("T") + ['[ATGC]']*2 + ['[ACG]'] + list("TTAA") + ['[TG]', '[ATG]', '[ATC]', '[TA]'])
+pmra = 'CTTAA[TG][AG][TC]T[ATGC]{2}[ACG]TTAA[ATG][ATG][ATC][TA]'
+pmra_l = (list("CTTAA") + ['[TG]', '[AG]', '[TC]'] + list("T") + ['[ATGC]']*2 + ['[ACG]'] + list("TTAA") + ['[ATG]', '[ATG]', '[ATC]', '[TA]'])
 pmra_mismatch = create_box_mismatches(pmra_l)
 
 csra = 'A?[ATGC]GGA[ATGC]{1,30}A?[ATGC]GGA'
 csra_l = (['A?'] + ['[ATGC]', 'G', 'G', 'A'] + ['[ATGC]{1,30}'] + ['A?'] + ['[ATGC]', 'G', 'G', 'A'])
-csra_mismatch = create_box_mismatches(csra_l)  
+csra_mismatch = create_box_mismatches(csra_l)
 
+# Not relevant in type IV
 tts_box = 'GTCAG[TCG]T[TCAG]{4}G[AT][AC]AG[CGT][TAC][ATCG]{3}[CTG]{2}[ATCG]{4}A'
 tts_box_l = ['G', 'T', 'C', 'A', 'G', '[TGC]', 'T']+['[ATGC]']*4+['G', '[AT]', '[AC]', 'A', 'G', '[CGT]', '[TAC]']+['[ATGC]']*3+['[CTG]']*2+['[ATGC]']*4+['A']
 tts_box_mismatch = create_box_mismatches(tts_box_l)
@@ -192,17 +264,34 @@ def existence_upstream_to_AUG(locus, pattern, promoter_dic,promoter_length=150):
         return 1
     else:
         return 0
-                
-    
+
+def existence_in_region(locus, pattern, region_dic):
+    region = region_dic[locus]
+    if re.search(pattern, str(region), re.I):
+        return 1
+    else:
+        return 0
+
+
 def main(ORFs_file, working_directory, gff_f, genome_f, PmrA=False, CpxR=False, CsrA=False, exs=False, tts=False):
     os.chdir(working_directory)
     locus_dic = fasta_parser.parse_ORFs(ORFs_file)
     locus_area_d, circulars = parse_gff_to_CDS_loc(gff_f, locus_dic)
+    promoters_d = get_promoters(
+        locus_area_d,
+        circulars,
+        genome_f
+    )
+
     if CsrA:
-        promoters_d = get_promoters(locus_area_d, circulars, genome_f, promoter_length=50)
-    else:
-        promoters_d = get_promoters(locus_area_d, circulars, genome_f)
-        
+        csra_regions_d = get_regions_around_ORF_start(
+            locus_area_d,
+            circulars,
+            genome_f,
+            upstream_length=100,
+            downstream_length=50
+        )
+
     with open(f'regulatory_features.csv', 'w', newline='') as f:
         csv_writer = csv.writer(f)
         header = ['locus']
@@ -226,7 +315,7 @@ def main(ORFs_file, working_directory, gff_f, genome_f, PmrA=False, CpxR=False, 
                 l.append(existence_upstream_to_AUG(locus, cpxr_mismatch, promoters_d, promoter_length=100))
                 #l.append(existence_upstream_to_AUG(locus,cpxr_mismatch))
             if CsrA:
-                l.append(existence_upstream_to_AUG(locus, csra, promoters_d))
+                l.append(existence_in_region(locus, csra, csra_regions_d))
                 #l.append(existence_upstream_to_AUG(locus,csra_mismatch))
             if exs:
                 l.append(existence_upstream_to_AUG(locus, exs_box, promoters_d))
@@ -234,7 +323,7 @@ def main(ORFs_file, working_directory, gff_f, genome_f, PmrA=False, CpxR=False, 
             if tts:
                 l.append(existence_upstream_to_AUG(locus, tts_box, promoters_d))
                 #l.append(existence_upstream_to_AUG(locus,tts_box_mismatch))
-                
+
             csv_writer.writerow(l)
     endfile = open('regulatory_features.done', 'w')
     endfile.close()
@@ -260,7 +349,7 @@ if __name__ == '__main__':
         parser.add_argument('--CsrA', help='look for CsrA in promoters', action='store_true')
         parser.add_argument('--exs', help='look for exs-box in promoters', action='store_true')
         parser.add_argument('--tts',help='look for tts-box in promoters', action='store_true')
-        
+
         args = parser.parse_args()
         ORFs_file = args.input_ORFs_path
         working_directory = args.output_dir_path

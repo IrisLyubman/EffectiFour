@@ -6,10 +6,26 @@ import math
 import numpy as np
 from functools import reduce
 
-working_directory = argv[1]
+working_directory = os.path.abspath(argv[1])
 os.chdir(working_directory)
 
-Effectidor_features_d = os.path.join(working_directory, 'Effectidor_runs')
+genome_sources_f = os.path.join(working_directory, 'genome_sources.csv')
+
+if not os.path.exists(genome_sources_f):
+    raise FileNotFoundError(
+        f'genome_sources.csv was not found in {working_directory}'
+    )
+
+genome_sources = pd.read_csv(genome_sources_f, dtype=str).fillna('')
+
+genome_sources['requested'] = (
+    genome_sources['requested']
+    .str.strip()
+    .str.lower()
+    .eq('true')
+)
+
+requested_genomes = genome_sources.loc[genome_sources['requested'], 'genome'].tolist()
 
 
 def get_ortho_dict(wd, ortho_f='clean_orthologs_table.csv'):
@@ -26,124 +42,204 @@ def get_ortho_dict(wd, ortho_f='clean_orthologs_table.csv'):
                 if genome not in genomes_orthogroup_dict:
                     genomes_orthogroup_dict[genome] = {}
                 for locus in row[i].split(';'):
-                    genomes_orthogroup_dict[genome][locus] = OG
+                    locus = locus.strip()
+                    if locus:
+                        genomes_orthogroup_dict[genome][locus] = OG
     return genomes_orthogroup_dict
 
 
 genomes_orthogroup_dict = get_ortho_dict(working_directory)
-flatten_ortho_dict = {key: genomes_orthogroup_dict[dic_name][key] for dic_name in genomes_orthogroup_dict
-                      for key in genomes_orthogroup_dict[dic_name]}
 
+# Collect pseudogenes and T4SS data from ALL genomes participating in the run.
+# All genomes are used for determining which OGs are T4SS OGs.
+# Only requested genomes are written to the user-facing T4SS.csv.
 
-# prepare the orthologs' table for final merge and remove from it the T4SS components:
-if os.path.exists(Effectidor_features_d):
-    pseudogenes = []
-    genomes = os.listdir(Effectidor_features_d)
-    for genome in genomes:
-        pseudogenes_path = os.path.join(Effectidor_features_d, genome, 'pseudogenes.txt')
-        with open(pseudogenes_path) as pseudo_f:
-            content = pseudo_f.read()
-            if content != '':
-                pseudogenes.extend(content.split('\n'))
-    T4SS_tables = []
-    for genome in genomes:
-        t4ss_path = os.path.join(Effectidor_features_d, genome, 'T4SS.csv')
-        df = pd.read_csv(t4ss_path, dtype={'Bacterial Protein ID': str})
-        df.insert(0, 'Genome', genome)
-        T4SS_tables.append(df)
+pseudogenes_by_genome = {}
+requested_T4SS_tables = []
+T4SS_OGs_to_remove = set()
 
-    merged_T4SS_df = pd.concat(T4SS_tables, ignore_index=True)
-    merged_T4SS_df.to_csv('T4SS.csv', index=False)
+for _, source in genome_sources.iterrows():
 
-else:
-    with open('pseudogenes.txt') as pseudo_f:
-        pseudogenes = pseudo_f.read().split('\n')
-    merged_T4SS_df = pd.read_csv('T4SS.csv', index_col='T4SS Protein', dtype={'Bacterial Protein ID': str})
-with open(os.path.join(working_directory, 'pseudogenes.txt'), 'w') as pseudo_f:
-    pseudo_f.write('\n'.join(pseudogenes))
+    genome = source['genome']
+    source_dir = source['source_dir']
+    requested = source['requested']
 
-T4SS_loci_to_remove = []
-if os.path.exists(Effectidor_features_d):
-    for genome in genomes:
-        t4ss_path = os.path.join(Effectidor_features_d, genome, 'T4SS.csv')
-        df = pd.read_csv(t4ss_path, dtype={'Bacterial Protein ID': str})
-        if 'Bacterial Protein ID' in df.columns:
-            ids = df['Bacterial Protein ID'].dropna()
-            ids = ids[ids.str.strip() != '']
-            T4SS_loci_to_remove.extend(ids.tolist())
-else:
-    df = pd.read_csv('T4SS.csv', dtype={'Bacterial Protein ID': str})
-    if 'Bacterial Protein ID' in df.columns:
-        ids = df['Bacterial Protein ID'].dropna()
+    # Pseudogenes
+    pseudogenes_path = os.path.join(source_dir, 'pseudogenes.txt')
+
+    if not os.path.exists(pseudogenes_path):
+        raise FileNotFoundError(
+            f'pseudogenes.txt was not found for genome {genome}: '
+            f'{pseudogenes_path}'
+        )
+
+    with open(pseudogenes_path) as pseudo_f:
+        pseudogenes = [
+            p.strip()
+            for p in pseudo_f.read().splitlines()
+            if p.strip()
+        ]
+
+    pseudogenes_by_genome[genome] = set(pseudogenes)
+
+    # T4SS
+    t4ss_path = os.path.join(source_dir, 'T4SS.csv')
+
+    if not os.path.exists(t4ss_path):
+        raise FileNotFoundError(
+            f'T4SS.csv was not found for genome {genome}: {t4ss_path}'
+        )
+
+    df = pd.read_csv(
+        t4ss_path,
+        dtype={'Bacterial Locus Tag': str}
+    )
+
+    # User-facing T4SS table should contain only requested genomes
+    if requested:
+        requested_df = df.copy()
+        requested_df.insert(0, 'Genome', genome)
+        requested_T4SS_tables.append(requested_df)
+
+    # But T4SS OG removal is based on ALL genomes
+    if 'Bacterial Locus Tag' in df.columns:
+
+        ids = df['Bacterial Locus Tag'].dropna().astype(str)
         ids = ids[ids.str.strip() != '']
-        T4SS_loci_to_remove.extend(ids.tolist())
-        
-if len(T4SS_loci_to_remove) > 0:
-    flattened_T4SS_loci_no_nan = T4SS_loci_to_remove
-    T4SS_OGs_to_remove = set([flatten_ortho_dict[locus] for locus in flattened_T4SS_loci_no_nan])
-    OGs_table = pd.read_csv('clean_orthologs_table.csv', index_col='OG_name', dtype=str)
-    OGs_no_T4SS = OGs_table.drop(index=list(T4SS_OGs_to_remove), errors="ignore")
+
+        for locus in ids:
+
+            locus = locus.strip()
+
+            OG = genomes_orthogroup_dict.get(
+                genome, {}
+            ).get(locus)
+
+            if OG is not None:
+                T4SS_OGs_to_remove.add(OG)
+
+
+# Write T4SS.csv only for requested genomes
+if requested_T4SS_tables:
+
+    merged_T4SS_df = pd.concat(
+        requested_T4SS_tables,
+        ignore_index=True
+    )
+
 else:
-    OGs_no_T4SS = pd.read_csv('clean_orthologs_table.csv', index_col='OG_name', dtype=str)
-OGs_no_T4SS.to_csv(os.path.join(working_directory, 'clean_orthologs_table_noT4SS.csv'))
+    merged_T4SS_df = pd.DataFrame()
+
+merged_T4SS_df.to_csv(
+    os.path.join(working_directory, 'T4SS.csv'),
+    index=False
+)
+
+
+# Write pseudogenes.txt only for requested genomes
+requested_pseudogenes = []
+
+for genome in requested_genomes:
+    requested_pseudogenes.extend(
+        sorted(pseudogenes_by_genome.get(genome, set()))
+    )
+
+with open(
+    os.path.join(working_directory, 'pseudogenes.txt'),
+    'w'
+) as pseudo_f:
+    pseudo_f.write('\n'.join(requested_pseudogenes))
+
+
+# Remove OGs containing T4SS components
+OGs_table = pd.read_csv(
+    'clean_orthologs_table.csv',
+    index_col='OG_name',
+    dtype=str
+)
+
+OGs_no_T4SS = OGs_table.drop(
+    index=list(T4SS_OGs_to_remove),
+    errors='ignore'
+)
+
+OGs_no_T4SS.to_csv(
+    os.path.join(
+        working_directory,
+        'clean_orthologs_table_noT4SS.csv'
+    )
+)
 
 genomes_orthogroup_dict = get_ortho_dict(working_directory, ortho_f='clean_orthologs_table_noT4SS.csv')
 
-with open(os.path.join(working_directory, 'clean_orthologs_table.csv')) as in_f:
-    with open('clean_orthologs_table_with_pseudo.csv', 'w') as out_f:
-        header = next(in_f)
-        header = header.replace('OG_name,', 'OG,')
-        out_f.write(header)
-        for row in in_f:
-            to_remove = []
-            for pseudo in pseudogenes:
-                if f'{pseudo},' in row or f'{pseudo};' in row or f'{pseudo}\n' in row or f'{pseudo}\r\n' in row:
-                    row = row.replace(f'{pseudo},', f'{pseudo}(pseudogene),')
-                    row = row.replace(f'{pseudo};', f'{pseudo}(pseudogene);')
-                    row = row.replace(f'{pseudo}\n', f'{pseudo}(pseudogene)\n')
-                    row = row.replace(f'{pseudo}\r\n', f'{pseudo}(pseudogene)\r\n')
-                    to_remove.append(pseudo)
-            out_f.write(row)
-            for pseudo in to_remove:
-                pseudogenes.remove(pseudo)
+# OGs that belong to at least one requested genome
+requested_OGs = set()
+
+for genome in requested_genomes:
+
+    if genome not in genomes_orthogroup_dict:
+        raise RuntimeError(
+            f'Requested genome {genome} was not found in the '
+            f'Microbializer orthogroups table.'
+        )
+
+    requested_OGs.update(genomes_orthogroup_dict[genome].values())
+
+with open(os.path.join(working_directory, 'requested_OGs.txt'), 'w') as out_f:
+    for OG in sorted(requested_OGs):
+        out_f.write(f'{OG}\n')
+
+ortho_df = pd.read_csv(os.path.join(working_directory, 'clean_orthologs_table.csv'), dtype=str).fillna('')
+ortho_df = ortho_df[['OG_name'] + requested_genomes].copy()
+
+for genome in requested_genomes:
+    genome_pseudogenes = pseudogenes_by_genome.get(genome, set())
+
+    for pseudo in genome_pseudogenes:
+        ortho_df[genome] = ortho_df[genome].apply(
+            lambda x: ';'.join([f'{locus}(pseudogene)' if locus == pseudo else locus for locus in x.split(';')])
+        )
+
+ortho_df.rename(columns={'OG_name': 'OG'}, inplace=True)
+ortho_df.to_csv('clean_orthologs_table_with_pseudo.csv', index=False)
 
 
-def combine_all_genomes_data(out_f_path, in_f_name):
-    with open(out_f_path, 'w', newline='') as out_path:
-        writer = csv.writer(out_path)
-        if os.path.exists(Effectidor_features_d):
-            genomes = os.listdir(Effectidor_features_d)
-            first_genome = genomes[0]
-            with open(os.path.join(Effectidor_features_d, first_genome, f'{in_f_name}.csv')) as in_f:
-                reader = csv.reader(in_f)
-                header = ['OG'] + next(reader)
-                writer.writerow(header)
-                for row in reader:
-                    if row[0] in genomes_orthogroup_dict[first_genome]:
-                        row = [genomes_orthogroup_dict[first_genome][row[0]]] + row
-                        writer.writerow(row)
-            for genome in genomes[1:]:
-                with open(os.path.join(Effectidor_features_d, genome, f'{in_f_name}.csv')) as in_f:
-                    reader = csv.reader(in_f)
-                    next(reader)
-                    for row in reader:
-                        if row[0] in genomes_orthogroup_dict[genome]:
-                            row = [genomes_orthogroup_dict[genome][row[0]]] + row
-                            writer.writerow(row)
-        else:
-            with open(f'{in_f_name}.csv') as in_f:
-                reader = csv.reader(in_f)
-                header = ['OG'] + next(reader)
-                writer.writerow(header)
-                for row in reader:
-                    if row[0] in genomes_orthogroup_dict['genome_ORFs']:
-                        row = [genomes_orthogroup_dict['genome_ORFs'][row[0]]] + row
-                        writer.writerow(row)
+def combine_all_genomes_data(out_f_path, in_f_name, requested_only=False):
+    sources = genome_sources[genome_sources['requested']] if requested_only else genome_sources
+    dfs = []
+
+    for _, source in sources.iterrows():
+        genome = source['genome']
+        source_dir = source['source_dir']
+        input_f = os.path.join(source_dir, f'{in_f_name}.csv')
+
+        if not os.path.exists(input_f):
+            raise FileNotFoundError(f'{in_f_name}.csv was not found for genome {genome}: {input_f}')
+
+        if genome not in genomes_orthogroup_dict:
+            raise RuntimeError(f'Genome {genome} was not found in the orthogroups table.')
+
+        df = pd.read_csv(input_f)
+        locus_col = df.columns[0]
+        df = df[df[locus_col].isin(genomes_orthogroup_dict[genome])].copy()
+        df.insert(0, 'OG', df[locus_col].map(genomes_orthogroup_dict[genome]))
+        dfs.append(df)
+
+    combined_df = pd.concat(dfs, ignore_index=True, sort=False)
+
+    if 'is_effector' in combined_df.columns:
+        cols = [col for col in combined_df.columns if col != 'is_effector'] + ['is_effector']
+        combined_df = combined_df[cols]
+
+    combined_df.to_csv(out_f_path, index=False)
 
 
-combine_all_genomes_data('full_data.csv', 'features')
-combine_all_genomes_data('full_OGs_annotations.csv', 'annotations')
-combine_all_genomes_data('full_effector_homologs.csv', 'closest_effector_homologs')
+# Training features: ALL genomes
+combine_all_genomes_data('full_data.csv', 'features', requested_only=False)
+
+# User-facing annotation information: requested genomes only
+combine_all_genomes_data('full_OGs_annotations.csv', 'annotations', requested_only=True)
+combine_all_genomes_data('full_effector_homologs.csv', 'closest_effector_homologs', requested_only=True)
 
 
 def groupbyMode(in_f, out_f, target, new_col_name):
@@ -168,8 +264,8 @@ def label(iterable_arg):
     elif any(iterable_arg == 'no'):
         return 'no'
     else:
-        return '?'   
-        
+        return '?'
+
 
 df = pd.read_csv('full_data.csv')
 features = list(df.columns[2:-1])
@@ -179,11 +275,16 @@ if 'distance_from_closest_effector' in features:
     median.append('distance_from_closest_effector')
 if 'distance_to_mobile_genetic_element' in features:
     median.append('distance_to_mobile_genetic_element')
-maximum_features = ['T4_signal', 'PmrA', 'cpxr', 'csra']
+maximum_features = ['T4_signal', 'PmrA', 'CpxR', 'CsrA', 'gnlp_cosine_similarity']
 maximum = [f for f in features if any(k in f for k in maximum_features)]
+minimum_features = [] # comment if euclidian distance is not relevant or add 'gnlp_euclidean_distance' when want to use
+minimum = [f for f in features if any(k in f for k in minimum_features)] # comment if euclidian distance is not relevant
+
 for feature in maximum:
     features.remove(feature)
 for feature in median:
+    features.remove(feature)
+for feature in minimum: # comment if euclidian distance is not relevant
     features.remove(feature)
 
 #%% transformation to OGs
@@ -191,6 +292,7 @@ df.sort_values(by=features, inplace=True)
 grouped = df.groupby('OG').agg({**{feature: ['mean'] for feature in features},
                                 **{feature: ['median'] for feature in median},
                                 **{feature: ['max'] for feature in maximum},
+                                **{feature: ['min'] for feature in minimum},
                                 **{'is_effector': label}})
 
 grouped.sort_values(by=list(grouped.columns[:-1]), inplace=True)
@@ -216,20 +318,24 @@ def aa_profile(OG):
         dis_to_non_eff = math.sqrt(sum([(a-b)**2 for a, b in zip(OG_aa_freqs.values, non_effector_1_mean.values)]))
     else:
         dis_to_non_eff = math.sqrt(sum([(a-b)**2 for a, b in zip(OG_aa_freqs.values, non_effectors_mean.values)]))
-    
+
     return dis_to_eff - dis_to_non_eff
 
 
 OGs = list(grouped.index)
 aa_profiles_dis = [aa_profile(OG) for OG in OGs]
 grouped.insert(len(grouped.columns)-1, 'similarity_to_effectors_vs_non_effectors', aa_profiles_dis)
- 
+
 #%% flatten columns and indices to a simple features table
 updated_features = grouped.reset_index()
 updated_features.columns = ['_'.join(col) for col in updated_features.columns.values]
 updated_features.columns = [col.replace('label', '_').strip('_') for col in updated_features.columns]
 updated_features.sort_values(by=list(updated_features.columns[1:]), inplace=True)
-updated_features.to_csv('OGs_features.csv', index=False)
 
+# Complete feature table used for training - all pan-genome + requested OGs
+updated_features.to_csv('OGs_features_training.csv', index=False)
+# User-facing feature table - only OGs present in requested genomes
+requested_features = updated_features[updated_features['OG'].isin(requested_OGs)].copy()
+requested_features.to_csv('OGs_features.csv', index=False)
 f = open('merge_OGs.done', 'w')
 f.close()

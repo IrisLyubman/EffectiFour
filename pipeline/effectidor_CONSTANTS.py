@@ -35,6 +35,8 @@ EFFECTIDOR_EXEC = os.path.join(PIPELINE_ROOT, 'script')
 EFFECTIDOR_DATA = os.path.join(EFFECTIDOR_EXEC, 'data')
 EFFECTIDOR_AUXILIARIES = os.path.join(EFFECTIDOR_EXEC, 'auxiliaries')
 MICROBIALIZER_SCRIPTS = '/microbializer'
+PANGENOME_RESULTS_DIR = os.path.join(EFFECTIDOR_RESULTS_DIR, 'pangenome')
+PANGENOME_RUNS_DIR = os.path.join(PANGENOME_RESULTS_DIR, 'Effectidor_runs')
 
 MAIN_SCRIPT = os.path.join(EFFECTIDOR_EXEC, 'main_T4Es.py')
 EMAIL_SCRIPT = os.path.join(EFFECTIDOR_AUXILIARIES, 'email_sender.py')

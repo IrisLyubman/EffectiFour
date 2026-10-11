@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import fasta_parser
 import re
+import effectidor_CONSTANTS as CONSTS
 
 
 def create_annotations_f(ORFs_f, gff_f='', out_f='', pseudo_f=''):
@@ -104,7 +105,7 @@ def add_annotations_to_predictions(in_f, out_f_normal, out_f_pseudo, annotations
                                     elif 'product=' in fe:
                                         annot = fe.split('=')[1]
                                 locus_annotation[locus] = annot
-                        
+
     recs = SeqIO.parse(annotations_fasta, 'fasta')
     T4SS_recs = SeqIO.to_dict(SeqIO.parse('T4SS_proteins.faa', 'fasta'))
     T4_hits_f = 'T4SS_hits.csv'
@@ -171,23 +172,68 @@ def add_annotations_to_predictions(in_f, out_f_normal, out_f_pseudo, annotations
                         else:
                             writer_normal.writerow(row)
 
+def replace_yes_annotations_with_closest_t4e(data, effector_homolog):
+    data = data.copy()
+    homologs = pd.read_csv(effector_homolog, dtype=str)
+
+    # Get annotations from the T4E database
+    effector_annotations = {}
+    T4Es_f = os.path.join(CONSTS.EFFECTIDOR_DATA, 'blast_data', 'T4Es.faa')
+
+    for rec in SeqIO.parse(T4Es_f, 'fasta'):
+        effector_annotations[rec.id] = rec.description[len(rec.id):].strip()
+
+    # Get the closest T4E annotation for each OG
+    homologs['Closest T4E annotation'] = homologs['Effector_homolog(s)'].map(effector_annotations)
+    og_to_t4e_annotation = homologs.set_index('OG')['Closest T4E annotation']
+
+    # Replace Annotation(s) only for yes-labeled OGs
+    yes_mask = data['is_effector'].astype(str).str.lower() == 'yes'
+    closest_annotations = data.loc[yes_mask, 'OG'].map(og_to_t4e_annotation)
+    data.loc[yes_mask, 'Annotation(s)'] = closest_annotations.fillna(data.loc[yes_mask, 'Annotation(s)'])
+
+    return data
+
 
 def make_html_tables(predictions_f, effector_homolog, T4SS=''):
     data = pd.read_csv(predictions_f)
-    predicted = data[data.is_effector == '?']
-    positives = data[data.is_effector == 'yes']
+
+    predicted = data[data.is_effector == '?'].copy()
+    positives = data[data.is_effector == 'yes'].copy()
+
     header = list(data.columns)
     header[1] = 'Score'
     predicted.columns = header
     positives.columns = header
+
     predicted = predicted.drop(columns=['is_effector'])
     positives = positives.drop(columns=['is_effector'])
+
     effector_homolog_df = pd.read_csv(effector_homolog)
-    predicted_table = predicted.head(10).merge(effector_homolog_df, how='left').to_html(
-        index=False, justify='left', escape=False)
-    positives_table = positives.merge(effector_homolog_df, how='left').to_html(
-        index=False, justify='left', escape=False)
-    # T4SS_data = pd.read_csv(T4SS)
-    # T4SS_table = T4SS_data.to_html(index=False,justify='left',escape=False)
+
+    # Get annotations from the T4E database
+    effector_annotations = {}
+    T4Es_f = os.path.join(CONSTS.EFFECTIDOR_DATA, 'blast_data', 'T4Es.faa')
+    for rec in SeqIO.parse(T4Es_f, 'fasta'):
+        effector_annotations[rec.id] = rec.description[len(rec.id):].strip()
+
+    predicted = predicted.merge(effector_homolog_df, on='OG', how='left')
+
+    positives = positives.merge(effector_homolog_df, on='OG', how='left')
+
+    positives['Annotation(s)'] = (
+        positives['Effector_homolog(s)']
+        .map(effector_annotations)
+        .fillna(positives['Annotation(s)'])
+    )
+    positives = positives.rename(columns={'Annotation(s)': 'Closest T4E annotation', 'Effector_homolog(s)': 'Closest T4E accession'})
+
+    predicted_table = predicted.head(10).to_html(
+        index=False, justify='left', escape=False
+    )
+
+    positives_table = positives.to_html(
+        index=False, justify='left', escape=False
+    )
+
     return predicted_table, positives_table
-    

@@ -15,26 +15,88 @@ import warnings
 
 logging.captureWarnings(True)
 
-working_directory = argv[1]
+working_directory = os.path.abspath(argv[1])
 identity_cutoff = argv[2]  # default: '50'
-coverage_cutoff = argv[3] # default: '60'
+coverage_cutoff = argv[3]  # default: '60'
 error_path = os.path.join(working_directory, 'error_OGs.txt')
 scripts_dir = CONSTS.EFFECTIDOR_AUXILIARIES
 os.chdir(working_directory)
-if not os.path.exists('genomes_for_Microbializer'):
-    os.makedirs('genomes_for_Microbializer')
 
-if os.path.exists('Effectidor_runs'):
-    for genome in os.listdir('Effectidor_runs'):
-        ORFs_f = os.path.join('Effectidor_runs', genome, 'ORFs.fasta')
-        locus_dic = fasta_parser.parse_ORFs(ORFs_f)
-        recs = [SeqRecord.SeqRecord(locus_dic[locus], id=locus) for locus in locus_dic]
-        SeqIO.write(recs, f'genomes_for_Microbializer/{genome}.fasta', 'fasta')
-else:
-    ORFs_f = 'ORFs.fasta'
-    locus_dic = fasta_parser.parse_ORFs(ORFs_f)
-    recs = [SeqRecord.SeqRecord(locus_dic[locus], id=locus) for locus in locus_dic]
-    SeqIO.write(recs, f'genomes_for_Microbializer/genome_ORFs.fasta', 'fasta')
+# Prepare all genomes for Microbializer according to genome_sources.csv
+genome_sources_f = os.path.join(working_directory, 'genome_sources.csv')
+microbializer_input_dir = os.path.join(working_directory, 'genomes_for_Microbializer')
+
+if not os.path.exists(genome_sources_f):
+    fail(
+        f'genome_sources.csv was not found in {working_directory}',
+        error_path
+    )
+
+# Remove previous input directory so old genomes from a previous run
+# cannot accidentally remain in the Microbializer input.
+if os.path.exists(microbializer_input_dir):
+    shutil.rmtree(microbializer_input_dir)
+
+os.makedirs(microbializer_input_dir)
+
+seen_gcfs = set()
+seen_orfs_paths = set()
+
+with open(genome_sources_f, newline='') as sources_f:
+    reader = csv.DictReader(sources_f)
+
+    for row in reader:
+        genome = row['genome'].strip()
+        gcf = row.get('gcf', '').strip().upper()
+        orfs_path = row.get('orfs_path', '').strip()
+
+        if not genome:
+            continue
+
+        if not orfs_path:
+            fail(
+                f'No ORFs path was provided for genome {genome}',
+                error_path
+            )
+
+        # Support both absolute and relative paths
+        if not os.path.isabs(orfs_path) and not os.path.exists(orfs_path):
+            orfs_path = os.path.join(working_directory, orfs_path)
+        orfs_path = os.path.abspath(orfs_path)
+
+        if not os.path.exists(orfs_path):
+            fail(f'ORFs file was not found for genome {genome}: {orfs_path}', error_path)
+
+        # genome_sources.csvshould already be deduplicated in main_T4Es.py, but keep this protection here as well.
+        if gcf:
+            if gcf in seen_gcfs:
+                continue
+            seen_gcfs.add(gcf)
+        else:
+            # For genomes without a GCF accession, prevent the exact same
+            # ORFs file from being added twice.
+            if orfs_path in seen_orfs_paths:
+                continue
+
+        seen_orfs_paths.add(orfs_path)
+
+        locus_dic = fasta_parser.parse_ORFs(orfs_path)
+
+        recs = [
+            SeqRecord.SeqRecord(
+                locus_dic[locus],
+                id=locus,
+                description=''
+            )
+            for locus in locus_dic
+        ]
+
+        output_f = os.path.join(
+            microbializer_input_dir,
+            f'{genome}.fasta'
+        )
+
+        SeqIO.write(recs, output_f, 'fasta')
 
 
 # Run Microbializer block Josef replace --contigs_dir with --input

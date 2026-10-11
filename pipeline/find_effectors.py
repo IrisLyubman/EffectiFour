@@ -1,6 +1,7 @@
 from Bio import SeqIO
 from sys import argv
 import os
+import csv
 from protein_mmseq import protein_mmseqs_all_vs_all
 
 effectors = argv[1]
@@ -10,6 +11,12 @@ minimal_coverage = float(argv[4])
 
 if not os.path.exists('blast_outputs'):
     os.makedirs('blast_outputs')
+
+effector_annotations = {}
+for rec in SeqIO.parse(effectors, 'fasta'):
+    annotation = rec.description[len(rec.id):].strip()
+    effector_annotations[rec.id] = annotation
+
 in_f = open(effectors)
 content = in_f.read()
 replaced_pipes = content.replace('|', '^')  # MMSeq changes the IDs when pipes are available in the rec.id,
@@ -34,21 +41,30 @@ def parse_blast_out(blast_out, e_val=10 ** (-10), min_identity=0.7, min_coverage
             identity = float(row[2])
             coverage = (float(row[3]) / effectors_lens[prot_id]) * 100
             prot_id = prot_id.replace('^', '|')
+
             if e_value <= e_val and identity >= min_identity and coverage >= min_coverage:
                 if prot_id not in blast_out_dic:
                     blast_out_dic[prot_id] = {hit}
                 else:
                     blast_out_dic[prot_id].add(hit)
-                if hit not in best_hits:
-                    best_hits[hit] = float(row[-1])
-                else:
-                    if float(row[-1]) > best_hits[hit]:
-                        best_hits[hit] = float(row[-1])
-        with open('blast_outputs/effectors_hits.csv', 'w') as out_f:
-            for hit in best_hits:
-                out_f.write(f'{hit},{best_hits[hit]}\n')
-    return blast_out_dic
 
+                score = float(row[-1]) # MMseqs bitscore
+                if hit not in best_hits or score > best_hits[hit]['score']:
+                    best_hits[hit] = {'score': score, 'effector': prot_id}
+
+    with open('blast_outputs/effectors_hits.csv', 'w') as out_f:
+        for hit, info in best_hits.items():
+            out_f.write(f"{hit},{info['score']}\n")
+
+    with open('blast_outputs/effectors_hits_with_annotations.csv', 'w', newline='') as out_f:
+        writer = csv.writer(out_f)
+        writer.writerow(['locus', 'database_effector', 'database_annotation', 'bitscore'])
+
+        for hit, info in best_hits.items():
+            effector_id = info['effector']
+            writer.writerow([hit, effector_id, effector_annotations.get(effector_id, ''), info['score']])
+
+    return blast_out_dic
 
 if not os.path.exists('tmp_mmseq'):
     os.makedirs('tmp_mmseq')

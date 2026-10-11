@@ -16,14 +16,23 @@ import os
 import seaborn as sns
 from sys import argv
 #%%
-wd = argv[1]
+wd = os.path.abspath(argv[1])
 features_file = argv[2]
+requested_OGs_file = argv[3]
 os.chdir(wd)
+
+if not os.path.isabs(features_file):
+    features_file = os.path.join(wd, features_file)
+if not os.path.isabs(requested_OGs_file):
+    requested_OGs_file = os.path.join(wd, requested_OGs_file)
+
+with open(requested_OGs_file) as f:
+    requested_OGs = {line.strip() for line in f if line.strip()}
 out_dir = 'out_learning'
 if not os.path.exists(out_dir):
     os.makedirs(out_dir)
- 
-# Create regulation table function 
+
+# Create regulation table function
 def create_regulation_table(consensus_predictions_f, features_f, out_f, regulatory_elements=None):
     if regulatory_elements is None:
         regulatory_elements = ['PmrA', 'CpxR', 'CsrA']
@@ -56,9 +65,9 @@ def create_regulation_table(consensus_predictions_f, features_f, out_f, regulato
                 present_elements.append(regulatory_name_by_col[col])
         if present_elements:
             rows.append([row[id_col], row['score'], ', '.join(present_elements)])
-    regulation_df = pd.DataFrame(rows,columns=['OG', 'prediction score', 'present regulatory element'])
+    regulation_df = pd.DataFrame(rows,columns=['OG', 'Prediction Score', 'Present Regulatory Element'])
     regulation_df.head(10).to_csv(out_f, index=False)
-    
+
 dataset = pd.read_csv(features_file)
 features_filled_nan = dataset[dataset.columns[1:-1]].fillna(dataset[dataset.columns[1:-1]].median())
 dataset = pd.concat([dataset[dataset.columns[0]], features_filled_nan, dataset[dataset.columns[-1]]], axis=1)
@@ -89,7 +98,7 @@ names = all_genome[:, 0]
 genes = pd.DataFrame(names)
 
 # normalization
-norm_scaler = MinMaxScaler(feature_range=(0, 1)) 
+norm_scaler = MinMaxScaler(feature_range=(0, 1))
 normalizedALL = norm_scaler.fit_transform(X_all)
 norm = pd.DataFrame(normalizedALL)
 norm_data = pd.concat([genes, norm, y], axis=1)
@@ -251,7 +260,7 @@ for name, model, X_TRAIN, X_TEST, Y_TRAIN, Y_TEST, all_X, all_data in updated_mo
     predictions_test = model.predict_proba(X_TEST)
     AUPRC_test = average_precision_score(Y_TEST, predictions_test[:, 1])
     results_test[name] = AUPRC_test, predictions_test
-    
+
 names = []
 values = []
 for key in results_test:
@@ -270,16 +279,16 @@ for algorithm in list(results_test.keys()):
         with open(f'{out_dir}/remaining_algorithms.txt', 'a') as rem_f:
             rem_f.write(f'{algorithm}: test:{results_test[algorithm][0]}, train:{results_train[algorithm][0]},{results_train[algorithm][1]} range:{results_train[algorithm][2]}\n')
 
-try: 
+try:
     all_classifiers_preds_test = []
     all_classifiers_scores_test = []
     for key in results_test:
         all_classifiers_preds_test.append(results_test[key][1][:, 1])
         all_classifiers_scores_test.append(results_test[key][0])
-    
+
     w_average = np.average(all_classifiers_preds_test, axis=0, weights=all_classifiers_scores_test)
     w_av_AUPRC = average_precision_score(Y_TEST, w_average)
-    
+
     # feature importance
     rdf = RandomForestClassifier(n_estimators=1000, random_state=seed)
     rdf.fit(X, Y)
@@ -290,7 +299,7 @@ try:
         writer.writerow(['feature', 'importance'])
         for feature in sorted_feature_importance:
             writer.writerow(feature)
-    
+
     predictions = {}
     algorithms_names = []
     for name, model, X_TRAIN, X_TEST, Y_TRAIN, Y_TEST, all_X, all_data in updated_models:
@@ -302,7 +311,7 @@ try:
                 for i in range(len(model_proba)):
                     predictions[name][array[i][0]] = model_proba[i][1]
                 algorithms_names.append(name)
-     
+
     with open(f'{out_dir}/predictions.csv', 'w', newline='') as file:
         f_writer = csv.writer(file)
         header = [ID_name]
@@ -314,6 +323,8 @@ try:
         header.append('is_effector')
         f_writer.writerow(header)
         for locus in sorted(predictions[algorithms_names[0]], key=predictions[algorithms_names[0]].get, reverse=True):
+            if locus not in requested_OGs:
+                continue
             l = [locus]
             for name in algorithms_names:
                 l.append(predictions[name][locus])
@@ -325,12 +336,12 @@ try:
             else:
                 l.append('?')
             f_writer.writerow(l)
-    
+
     preds_df = pd.read_csv(f'{out_dir}/predictions.csv')
-    
+
     classifiers_scores = {f'{name} (AUPRC {"%.3f" % results_test[name][0]})': results_test[name][0] for name in results_test}
     classifiers_scores[f'wVote (AUPRC {"%.3f" % w_av_AUPRC})'] = w_av_AUPRC
-        
+
     best_classifier = max(classifiers_scores, key=lambda key: classifiers_scores[key])
     if classifiers_scores[best_classifier]-w_av_AUPRC > 0.15:  # if another classifier is significantly better than
         # the vote, take it.
@@ -345,9 +356,9 @@ try:
     sorted_consensus.rename(columns={score_label: f'score'}, inplace=True)
     rounded_scores = sorted_consensus.round({f'score': 3})
     rounded_scores.to_csv(f'{out_dir}/consensus_predictions.csv', index=False)
-    
+
     # figures
-    
+
     importance_f = f'{out_dir}/feature_importance.csv'
     best_features = []
     with open(importance_f, 'r') as in_f:
@@ -380,12 +391,12 @@ try:
     #fig.suptitle('Feature importance\n',y=1)
     fig.subplots_adjust(left=0.5)
     fig.tight_layout()
-    
+
     fig.savefig(f'{out_dir}/feature_importance.png')
 except:
     endfile = open(f'{out_dir}/learning_failed.txt', 'w')
     endfile.close()
-    
+
     results_train = {}
     results_test = {}
     for name, model, X_TRAIN, X_TEST, Y_TRAIN, Y_TEST, all_X, all_data in updated_models:
@@ -399,16 +410,16 @@ except:
         predictions_test = model.predict_proba(X_TEST)
         AUPRC_test = average_precision_score(Y_TEST, predictions_test[:, 1])
         results_test[name] = AUPRC_test, predictions_test
-        
+
     all_classifiers_preds_test = []
     all_classifiers_scores_test = []
     for key in results_test:
         all_classifiers_preds_test.append(results_test[key][1][:, 1])
         all_classifiers_scores_test.append(results_test[key][0])
-    
+
     w_average = np.average(all_classifiers_preds_test, axis=0, weights=all_classifiers_scores_test)
     w_av_AUPRC = average_precision_score(Y_TEST, w_average)
-    
+
     # feature importance
     rdf = RandomForestClassifier(n_estimators=1000, random_state=seed)
     rdf.fit(X, Y)
@@ -419,7 +430,7 @@ except:
         writer.writerow(['feature', 'importance'])
         for feature in sorted_feature_importance:
             writer.writerow(feature)
-    
+
     predictions = {}
     algorithms_names = []
     for name, model, X_TRAIN, X_TEST, Y_TRAIN, Y_TEST, all_X, all_data in updated_models:
@@ -431,7 +442,7 @@ except:
                 for i in range(len(model_proba)):
                     predictions[name][array[i][0]] = model_proba[i][1]
                 algorithms_names.append(name)
-     
+
     with open(f'{out_dir}/predictions.csv', 'w', newline='') as file:
         f_writer = csv.writer(file)
         header = [ID_name]
@@ -443,6 +454,8 @@ except:
         header.append('is_effector')
         f_writer.writerow(header)
         for locus in sorted(predictions[algorithms_names[0]], key=predictions[algorithms_names[0]].get, reverse=True):
+            if locus not in requested_OGs:
+                continue
             l = [locus]
             for name in algorithms_names:
                 l.append(predictions[name][locus])
@@ -454,12 +467,12 @@ except:
             else:
                 l.append('?')
             f_writer.writerow(l)
-    
+
     preds_df = pd.read_csv(f'{out_dir}/predictions.csv')
-    
+
     classifiers_scores = {f'{name} (AUPRC {"%.3f" % results_test[name][0]})': results_test[name][0] for name in results_test}
     classifiers_scores[f'wVote (AUPRC {"%.3f" % w_av_AUPRC})'] = w_av_AUPRC
-        
+
     best_classifier = max(classifiers_scores, key=lambda key: classifiers_scores[key])
     if classifiers_scores[best_classifier]-w_av_AUPRC > 0.15:  # if another classifier is significantly better than
         # the vote, take it.
@@ -471,9 +484,9 @@ except:
     sorted_consensus = consensus_df.sort_values(by='score', ascending=False)
     rounded_scores = sorted_consensus.round({'score': 3})
     rounded_scores.to_csv(f'{out_dir}/consensus_predictions.csv', index=False)
-    
+
     # figures
-    
+
     importance_f = f'{out_dir}/feature_importance.csv'
     best_features = []
     with open(importance_f, 'r') as in_f:
@@ -506,9 +519,9 @@ except:
     #fig.suptitle('Feature importance\n',y=1)
     fig.subplots_adjust(left=0.5)
     fig.tight_layout()
-    
+
     fig.savefig(f'{out_dir}/feature_importance.png')
-    
+
 # Create regulation table file
 consensus_predictions_f = f'{out_dir}/consensus_predictions.csv'
 if os.path.exists(consensus_predictions_f):

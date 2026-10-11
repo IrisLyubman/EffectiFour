@@ -13,7 +13,7 @@ import shutil
 import re
 import subprocess
 import pandas as pd
-from add_annotations_to_predictions import make_html_tables
+from add_annotations_to_predictions import make_html_tables, replace_yes_annotations_with_closest_t4e
 from csv_to_colored_xlsx_converter import convert_csv_to_colored_xlsx
 
 data_dir = CONSTS.EFFECTIDOR_DATA
@@ -49,6 +49,184 @@ logger.addHandler(stderr_handler)
 ILLEGAL_CHARS = ':;,\'\"'
 
 python_ver = 'python' #/groups/pupko/modules/python-anaconda3.6.5/bin/python
+
+GCF_PATTERN = re.compile(r'((?:GCF|GCA)_\d+)(?:\.\d+)?', re.IGNORECASE)
+def extract_gcf(name):
+    match = GCF_PATTERN.search(str(name))
+    return match.group(1).upper() if match else None
+def normalize_genome_name(path):
+    """
+    Uses the same naming convention as validate_input().
+    """
+    filename = os.path.basename(path)
+    genome_name = os.path.splitext(filename)[0]
+    genome_name = re.sub(r'\W+', '_', genome_name)
+    return genome_name.strip('_')
+
+
+def validate_cached_genome(genome_dir):
+    """
+    Make sure the cached genome contains everything needed downstream.
+    """
+    required_files = [
+        'ORFs.fasta',
+        'features.csv',
+        'annotations.csv',
+        'closest_effector_homologs.csv',
+        'pseudogenes.txt',
+        'T4SS.csv'
+    ]
+
+    missing_files = [
+        filename
+        for filename in required_files
+        if not os.path.isfile(os.path.join(genome_dir, filename))
+    ]
+
+    if missing_files:
+        raise RuntimeError(
+            f'Incomplete pan-genome cache in {genome_dir}. '
+            f'Missing files: {", ".join(missing_files)}'
+        )
+
+
+def build_genome_sources_manifest(output_dir_path, ORFs_path):
+    """
+    Create a table describing every genome that participates in the analysis.
+
+    requested=True:
+        Genome was submitted by the current user.
+
+    cached=True:
+        Features and ORFs are reused from the permanent pan-genome run.
+
+    The comparison between submitted and cached genomes is performed only
+    according to their GCF accession.
+    """
+    pangenome_runs_dir = CONSTS.PANGENOME_RUNS_DIR
+    current_runs_dir = os.path.join(output_dir_path, 'Effectidor_runs')
+
+    rows = []
+    pangenome_by_gcf = {}
+
+    # Add all permanent pan-genome genomes.
+    for genome in sorted(os.listdir(pangenome_runs_dir)):
+        source_dir = os.path.join(pangenome_runs_dir, genome)
+
+        if not os.path.isdir(source_dir):
+            continue
+
+        validate_cached_genome(source_dir)
+
+        gcf = extract_gcf(genome)
+
+        row = {
+            'genome': genome,
+            'gcf': gcf if gcf else '',
+            'requested': False,
+            'cached': True,
+            'source_dir': source_dir,
+            'orfs_path': os.path.join(source_dir, 'ORFs.fasta')
+        }
+
+        rows.append(row)
+
+        if gcf:
+            if gcf in pangenome_by_gcf:
+                raise RuntimeError(
+                    f'More than one pan-genome directory matches {gcf}: '
+                    f'{pangenome_by_gcf[gcf]["source_dir"]} and {source_dir}'
+                )
+
+            pangenome_by_gcf[gcf] = row
+
+    # Find the genomes submitted in the current run.
+    if os.path.isdir(current_runs_dir):
+        requested_inputs = [
+            {
+                'genome': genome,
+                'source_dir': os.path.join(current_runs_dir, genome),
+                'orfs_path': os.path.join(
+                    current_runs_dir,
+                    genome,
+                    'ORFs.fasta'
+                )
+            }
+            for genome in sorted(os.listdir(current_runs_dir))
+            if os.path.isdir(os.path.join(current_runs_dir, genome))
+        ]
+    else:
+        # Single-genome run.
+        original_name_f = os.path.join(output_dir_path, 'original_ORFs_name.txt')
+
+        if os.path.exists(original_name_f):
+            with open(original_name_f) as f:
+                genome_name = normalize_genome_name(f.read().strip())
+        else:
+            genome_name = normalize_genome_name(ORFs_path)
+
+        requested_inputs = [{
+            'genome': genome_name,
+            'source_dir': output_dir_path,
+            'orfs_path': ORFs_path
+        }]
+
+    cached_requested_gcfs = set()
+    requested_manifest_names = []
+
+    for requested in requested_inputs:
+        requested_gcf = extract_gcf(requested['genome'])
+
+        if requested_gcf is None:
+            requested_gcf = extract_gcf(requested['orfs_path'])
+
+        # Reuse only according to GCF accession.
+        if requested_gcf and requested_gcf in pangenome_by_gcf:
+            cached_row = pangenome_by_gcf[requested_gcf]
+            cached_row['requested'] = True
+
+            cached_requested_gcfs.add(requested_gcf)
+            requested_manifest_names.append(cached_row['genome'])
+
+            logger.info(
+                f'{requested["genome"]} matches {requested_gcf} in the '
+                f'pan-genome. Cached features will be reused from '
+                f'{cached_row["source_dir"]}.'
+            )
+
+        else:
+            rows.append({
+                'genome': requested['genome'],
+                'gcf': requested_gcf if requested_gcf else '',
+                'requested': True,
+                'cached': False,
+                'source_dir': requested['source_dir'],
+                'orfs_path': requested['orfs_path']
+            })
+
+            requested_manifest_names.append(requested['genome'])
+
+    manifest_path = os.path.join(
+        output_dir_path,
+        'genome_sources.csv'
+    )
+
+    pd.DataFrame(rows).to_csv(manifest_path, index=False)
+
+    requested_genomes_path = os.path.join(
+        output_dir_path,
+        'requested_genomes.txt'
+    )
+
+    with open(requested_genomes_path, 'w') as requested_file:
+        requested_file.write('\n'.join(requested_manifest_names) + '\n')
+
+    logger.info(
+        f'Genome manifest created with {len(rows)} total genomes and '
+        f'{len(requested_manifest_names)} requested genomes.'
+    )
+
+    return cached_requested_gcfs
 
 def has_illegal_chars(s):
     # Check if the first word in the string (which is the record ID) contains illegal characters
@@ -148,7 +326,7 @@ def verify_fasta_format(fasta_path, Type, input_name):
 def verify_ORFs(ORFs_path):
     logger.info(f'Validating ORFs:{ORFs_path}')
     ORFs_recs = list(SeqIO.parse(ORFs_path, 'fasta'))
-    if len(ORFs_recs) < 800:
+    if len(ORFs_recs) < 400:
         return f'The ORFs file contains only {str(len(ORFs_recs))} records. Make sure this file contains all the ' \
                f'ORFs (open reading frames) in the genome - Effectidor is designed to analyze full genomes and not ' \
                f'a sample of genes. Also, make sure this file contains ORFs and not full genome sequence! The full ' \
@@ -267,8 +445,8 @@ def validate_gff_format(gff_f, genome_name=''):
     with open(gff_f) as in_f:
         first_line = in_f.readline()
         if not (first_line.startswith("##gff-version") or first_line.startswith("##sequence-region")):
-            return f'''Illegal GFF format! The GFF file for the genome {genome_name} is not in <a 
-            href="http://gmod.org/wiki/GFF3" target="_blank">GFF3</a> format!<br> The content in the file does not 
+            return f'''Illegal GFF format! The GFF file for the genome {genome_name} is not in <a
+            href="http://gmod.org/wiki/GFF3" target="_blank">GFF3</a> format!<br> The content in the file does not
             start with a line of ##gff-version or ##sequence-region as must be '''
 
 
@@ -295,7 +473,7 @@ def validate_gff(gff_f, ORFs_f, genome_name=''):
     RNA_set.update(RNA)
     not_in_gff = [locus for locus in locus_dic if (locus not in CDS_set and locus not in RNA_set)]
     if len(not_in_gff) > 0:
-        return f'''For the genome {genome_name} there are records in your ORFs input that are not available in the 
+        return f'''For the genome {genome_name} there are records in your ORFs input that are not available in the
         corresponding GFF input. Please revise your input and submit again.<br> These records are:<br>
         {", ".join(not_in_gff)} '''
     if len(RNA_set) > 0:
@@ -330,7 +508,7 @@ def validate_genome_and_gff(gff_f, genome_f, ORFs_f):
                 non_unique.append(ID)
         non_unique = set(non_unique)
         return f'''Several contigs appear more than once within the genomic sequences data. These contigs IDs are:<br>
-                {", ".join(non_unique)}<br>Please make sure to upload the genomic sequences such that each sequence 
+                {", ".join(non_unique)}<br>Please make sure to upload the genomic sequences such that each sequence
                 will appear only once in the file, with unique IDs, matching to the IDs listed in the GFF file.'''
         # return f'IDs: {str(genome_recs)}'
     not_in_genome = []
@@ -339,7 +517,7 @@ def validate_genome_and_gff(gff_f, genome_f, ORFs_f):
             not_in_genome.append(region)
     if len(not_in_genome) > 0:
         return f'''The following regions from the GFF file are not found in the full genome file:<br>
-                {", ".join(not_in_genome)}.<br>Make sure the regions names are matching between the GFF 
+                {", ".join(not_in_genome)}.<br>Make sure the regions names are matching between the GFF
                 and genome files and re-submit the job. '''
 
 
@@ -365,8 +543,7 @@ def validate_input(output_dir_path, ORFs_path, effectors_path, input_T4Es_path, 
                 error_msg = verify_ORFs(f'{output_dir_path}/ORFs_tmp/{file}')
                 if error_msg:
                     fail(f'For file {file} in your ORFs input: {error_msg}', error_path)
-                genome_name = '_'.join(file.split('/')[-1].split('.')[0].split(' '))
-                genome_name = re.sub(r'\W', '', rf'{genome_name}')
+                genome_name = normalize_genome_name(file)
                 ORFs_genomes.append(genome_name)
                 os.makedirs(os.path.join(output_dir_path, 'Effectidor_runs', genome_name), exist_ok=True)
                 shutil.move(os.path.join(output_dir_path, 'ORFs_tmp', file),
@@ -403,8 +580,7 @@ def validate_input(output_dir_path, ORFs_path, effectors_path, input_T4Es_path, 
             for file in os.listdir(f'{output_dir_path}/gff_tmp'):
                 if os.path.isfile(f'{output_dir_path}/gff_tmp/{file}') and not file.startswith(
                         '_') and not file.startswith('.'):
-                    genome_name = '_'.join(file.split('/')[-1].split('.')[0].split(' '))
-                    genome_name = re.sub(r'\W', '', rf'{genome_name}')
+                    genome_name = normalize_genome_name(file)
                     gff_genomes.append(genome_name)
                     if genome_name in os.listdir(f'{output_dir_path}/Effectidor_runs'):
                         shutil.move(os.path.join(output_dir_path, 'gff_tmp', file),
@@ -449,8 +625,7 @@ def validate_input(output_dir_path, ORFs_path, effectors_path, input_T4Es_path, 
                         if error_msg:
                             error_msg = f'Illegal fasta files in {file} in full genome archive: {error_msg}'
                             fail(error_msg, error_path)
-                        genome_name = '_'.join(file.split('/')[-1].split('.')[0].split(' '))
-                        genome_name = re.sub(r'\W', '', rf'{genome_name}')
+                        genome_name = normalize_genome_name(file)
                         # print(f'file:{file}, genome:{genome_name}')
                         full_genome_names.append(genome_name)
                         if genome_name in os.listdir(f'{output_dir_path}/Effectidor_runs'):
@@ -504,8 +679,7 @@ def validate_input(output_dir_path, ORFs_path, effectors_path, input_T4Es_path, 
                                              f'File {file} in your effectors input')
                     if error_msg:
                         fail(error_msg, error_path)
-                    genome_name = '_'.join(file.split('/')[-1].split('.')[0].split(' '))
-                    genome_name = re.sub(r'\W', '', rf'{genome_name}')
+                    genome_name = normalize_genome_name(file)
                     if genome_name in os.listdir(f'{output_dir_path}/Effectidor_runs'):
                         shutil.move(os.path.join(output_dir_path, 'effectors_tmp', file),
                                     os.path.join(output_dir_path, 'Effectidor_runs', genome_name, 'effectors.fasta'))
@@ -646,6 +820,7 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
 
         validate_input(output_dir_path, ORFs_path, effectors_path, input_T4Es_path, host_proteome, genome_path,
                        gff_path, no_T4SS, error_path)
+        cached_requested_gcfs = build_genome_sources_manifest(output_dir_path, ORFs_path)
 
         find_OGs_cmd = f'module load MMseqs2/May2024;!@#python ' \
                        f'{os.path.join(scripts_dir, "find_OGs_in_genomes.py")} ' \
@@ -661,6 +836,13 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
         if os.path.exists(f'{output_dir_path}/Effectidor_runs'):
             currently_running = []
             for genome in os.listdir(f'{output_dir_path}/Effectidor_runs'):
+                genome_gcf = extract_gcf(genome)
+                if genome_gcf in cached_requested_gcfs:
+                    logger.info(
+                        f'Skipping feature extraction for {genome}: '
+                        f'{genome_gcf} already exists in the pan-genome.'
+                    )
+                    continue
                 genome_ORFs_path = os.path.join(f'{output_dir_path}/Effectidor_runs', genome, 'ORFs.fasta')
                 genome_output_path = os.path.join(f'{output_dir_path}/Effectidor_runs', genome)
                 genome_error = os.path.join(f'{output_dir_path}/Effectidor_runs', genome, 'error.txt')
@@ -705,7 +887,7 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
                 # make sure it was submitted successfully before proceeding
                 # TO COMPLETE
                 currently_running.append(genome)
-                while len(currently_running) > 4:  # features can be extracted for up to 5 genomes at a time,
+                while len(currently_running) > 19:  # features can be extracted for up to 20 genomes at a time,
                     # to avoid overload the cluster.
                     sleep(30)
                     for Genome in currently_running:
@@ -727,10 +909,34 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
                     os.path.join(output_dir_path, "Effectidor_runs", genome, 'features.csv'))]
 
         else:
-            effectors_learn(error_path, ORFs_path, effectors_path, output_dir_path, tmp_dir, queue, gff_path,
-                            genome_path, PmrA=PmrA, CpxR=CpxR, CsrA=CsrA, exs=exs, tts=tts,
-                            homology_search=homology_search, signal=signal, signalp=signalp, MGE=MGE,
-                            coverage=effectors_coverage)
+            if cached_requested_gcfs:
+                logger.info(
+                    f'Skipping feature extraction for the single-genome run: '
+                    f'{next(iter(cached_requested_gcfs))} already exists in the pan-genome.'
+                )
+
+            else:
+                effectors_learn(
+                    error_path,
+                    ORFs_path,
+                    effectors_path,
+                    output_dir_path,
+                    tmp_dir,
+                    queue,
+                    gff_path,
+                    genome_path,
+                    PmrA=PmrA,
+                    CpxR=CpxR,
+                    CsrA=CsrA,
+                    exs=exs,
+                    tts=tts,
+                    homology_search=homology_search,
+                    signal=signal,
+                    signalp=signalp,
+                    MGE=MGE,
+                    coverage=effectors_coverage
+                )
+
         while not os.path.exists(os.path.join(output_dir_path, 'clean_orthologs_table.csv')):
             # make sure it didn't fail
             if os.path.exists(os.path.join(output_dir_path, 'error_OGs.txt')):
@@ -753,7 +959,7 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
         #subprocess.check_output(['python', os.path.join(scripts_dir, 'merge_features_for_OGs.py'), output_dir_path])
 
         annotations_df = pd.read_csv(f'{output_dir_path}/OGs_annotations.csv')
-        features_data = pd.read_csv(f'{output_dir_path}/OGs_features.csv')
+        features_data = pd.read_csv(f'{output_dir_path}/OGs_features_training.csv')
         try:
             positives_size = features_data['is_effector'].value_counts()['effector']
         except KeyError:
@@ -765,19 +971,30 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
         elif positives_size < 3:
             effectors = features_data[features_data['is_effector'] == 'effector']
             homologs = pd.read_csv(f'{output_dir_path}/OG_effector_homologs.csv')
-            positives_table = annotations_df[annotations_df['OG'].isin(effectors['OG'])].merge(homologs, how='left').to_html(
-                index=False, justify='left', escape=False)
+
+            positives_data = annotations_df[annotations_df['OG'].isin(effectors['OG'])].copy()
+            positives_data['is_effector'] = 'yes'
+            positives_data = replace_yes_annotations_with_closest_t4e(
+                positives_data,
+                f'{output_dir_path}/OG_effector_homologs.csv'
+            )
+            positives_data = positives_data.drop(columns=['is_effector'])
+            positives_data = positives_data.rename(columns={'Annotation(s)': 'Closest T4E annotation'})
+            positives_table = positives_data.merge(homologs, on='OG', how='left').to_html(
+                index=False, justify='left', escape=False
+            )
             predicted_table = ''
+
 
         # learning step
         else:
             subprocess.check_output(
-                ['python', os.path.join(scripts_dir, 'learning.py'), output_dir_path, 'OGs_features.csv'])
+                ['python', os.path.join(scripts_dir, 'learning.py'), output_dir_path, 'OGs_features_training.csv', 'requested_OGs.txt'])
             preds_df = pd.read_csv(f'{output_dir_path}/out_learning/consensus_predictions.csv')
             ortho_df = pd.read_csv(f'{output_dir_path}/clean_orthologs_table_with_pseudo.csv')
             annotated_preds = preds_df.merge(annotations_df)
-            annotated_preds.to_csv(f'{output_dir_path}/out_learning/consensus_predictions_with_annotations.csv',
-                                   index=False)
+            annotated_preds = replace_yes_annotations_with_closest_t4e(annotated_preds, f'{output_dir_path}/OG_effector_homologs.csv')
+            annotated_preds.to_csv(f'{output_dir_path}/out_learning/consensus_predictions_with_annotations.csv', index=False)
             annotated_preds.merge(ortho_df).to_csv(
                 f'{output_dir_path}/out_learning/consensus_predictions_with_annotations_and_ortho_table.csv',
                 index=False)
@@ -786,12 +1003,15 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
 
             predicted_table, positives_table = make_html_tables(
                 f'{output_dir_path}/out_learning/consensus_predictions_with_annotations.csv',
-                f'{output_dir_path}/OG_effector_homologs.csv')
-            if os.path.exists(f'{output_dir_path}/Effectidor_runs'):
-                num_genomes = len(os.listdir(f'{output_dir_path}/Effectidor_runs'))
-                if num_genomes > 1:
-                    subprocess.check_output(['python', os.path.join(scripts_dir, 'phyletic_patterns.py'),
-                                             output_dir_path])
+                f'{output_dir_path}/OG_effector_homologs.csv'
+            )
+            requested_genomes_f = os.path.join(output_dir_path, 'requested_genomes.txt')
+            with open(requested_genomes_f) as f:
+                num_requested_genomes = sum(1 for line in f if line.strip())
+
+            if num_requested_genomes > 1:
+                subprocess.check_output(['python', os.path.join(scripts_dir, 'phyletic_patterns.py'),
+                                         output_dir_path])
         low_quality_flag = False
         if os.path.exists(f'{output_dir_path}/out_learning/learning_failed.txt'):
             low_quality_flag = True
@@ -799,21 +1019,17 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
         T4SS_data = pd.read_csv(os.path.join(output_dir_path, 'T4SS.csv'), dtype=str)
         T4SS_table = T4SS_data.dropna()
         T4SS_table = T4SS_table.to_html(index=False, justify='left', escape=False)
-        
+
         # Add regulation table:
         regulation_table = ''
         regulation_f = os.path.join(output_dir_path, 'out_learning', 'regulation.csv')
         if os.path.exists(regulation_f):
             regulation_data = pd.read_csv(regulation_f, dtype=str)
             if not regulation_data.empty:
-                annotations_df = pd.read_csv(f'{output_dir_path}/OGs_annotations.csv', dtype=str)
+                prediction_annotations = pd.read_csv(f'{output_dir_path}/out_learning/consensus_predictions_with_annotations.csv', dtype=str)
 
                 # Add annotation column to regulation table
-                regulation_data = regulation_data.merge(
-                    annotations_df[['OG', 'Annotation(s)']],
-                    on='OG',
-                    how='left'
-                )
+                regulation_data = regulation_data.merge(prediction_annotations[['OG', 'Annotation(s)']].drop_duplicates(), on='OG', how='left')
                 cols = list(regulation_data.columns)
                 if 'Annotation(s)' in cols:
                     cols.remove('Annotation(s)')
@@ -826,7 +1042,7 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
                     cols.insert(insert_after, 'Annotation(s)')
                     regulation_data = regulation_data[cols]
                 regulation_table = regulation_data.to_html(index=False, justify='left', escape=False)
-            
+
         if html_path:
             # shutil.make_archive(final_zip_path, 'zip', output_dir_path)
             finalize_html(html_path, error_path, run_number, predicted_table, positives_table, T4SS_table, regulation_table, low_quality_flag, output_dir_path)
@@ -849,10 +1065,10 @@ def main(ORFs_path, output_dir_path, effectors_path, input_T4Es_path, host_prote
 
 
 def finalize_html(html_path, error_path, run_number, predicted_table, positives_table, T4SS_table, regulation_table, low_quality_flag, output_dir_path):
-    
+
     #check if word error exists in error_path
     succeeded = True
-    if os.path.exists(error_path): 
+    if os.path.exists(error_path):
         pattern = "error"
         exclude = "error in future"
         exclude2 = "error in a future"
@@ -867,8 +1083,8 @@ def finalize_html(html_path, error_path, run_number, predicted_table, positives_
                     succeeded = False
                 if line.find('error:') != -1:
                     succeeded = False
-        
-    logger.info(f'SUCCEEDED = {succeeded}') 
+
+    logger.info(f'SUCCEEDED = {succeeded}')
     if succeeded:
         open(os.path.join(output_dir_path, f'effectidor_{run_number}.END_OK'), "w").close()
         edit_success_html(CONSTS, html_path, predicted_table, positives_table, T4SS_table, regulation_table, low_quality_flag, output_dir_path)
@@ -903,14 +1119,16 @@ def edit_success_html(CONSTS, html_path, predicted_table, positives_table, T4SS_
                 <br>
                 <h3><b>Top 10 predictions, among unlabeled samples</b></h3>
                 {predicted_table}
-                {f"<br><h3><b>Effectors Regulation – Top 10 predictions with detected regulatory elements</b></h3><br>{regulation_table}" if regulation_table else ""}
+                {f"<br><h3><b>Effectors Regulation – Top predictions with detected regulatory elements</b></h3><br>{regulation_table}" if regulation_table else ""}
                 </div>
                 <div class="container" style="{CONSTS.CONTAINER_STYLE}" align='center'>
                 ''')
                 #<a href='chaperones.csv' target='_blank'>Download chaperones details</a>
-        if os.path.exists(f'{output_dir_path}/Effectidor_runs'):
-            num_genomes = len(os.listdir(f'{output_dir_path}/Effectidor_runs'))
-            if num_genomes > 1:
+        requested_genomes_f = os.path.join(output_dir_path, 'requested_genomes.txt')
+        with open(requested_genomes_f) as f:
+            num_requested_genomes = sum(1 for line in f if line.strip())
+
+        if num_requested_genomes > 1:
                 append_to_html(html_path, f'''
                     <br>
                     <h3><b>T4Es presence/absence map</b></h3>
@@ -954,8 +1172,8 @@ def edit_success_html(CONSTS, html_path, predicted_table, positives_table, T4SS_
                 ''')
     else:
         append_to_html(html_path, f'''
-                <div class="container" style="{CONSTS.CONTAINER_STYLE}" align='left'> Unfortunately, we could not 
-                train a satisfying classifier due to small positive set.<br>The effectors found based on homology are 
+                <div class="container" style="{CONSTS.CONTAINER_STYLE}" align='left'> Unfortunately, we could not
+                train a satisfying classifier due to small positive set.<br>The effectors found based on homology are
                 listed in the table bellow:<br> {positives_table} <br>
                 <a href='clean_orthologs_table_with_pseudo.csv' target='_blank'>Download the OGs table</a>
                 <br>
@@ -988,13 +1206,13 @@ def add_closing_html_tags(html_path, CONSTS, run_number):
             <hr>
                 <h4 class=footer>
                     <p align='center'>Questions and comments are welcome! Please
-                        <span class="admin_link"> 
-                        <a href="mailto:{CONSTS.ADMIN_EMAIL}?subject={CONSTS.WEBSERVER_NAME.upper()}%20Run%20Number%20{run_number}">contact us</a> 
+                        <span class="admin_link">
+                        <a href="mailto:{CONSTS.ADMIN_EMAIL}?subject={CONSTS.WEBSERVER_NAME.upper()}%20Run%20Number%20{run_number}">contact us</a>
                         </span>
                     </p>
                 </h4>
                 <div id="bottom_links" align="center"><span class="bottom_link">
-                <a href="{CONSTS.WEBSERVER_URL}" target="_blank">Home</a>  
+                <a href="{CONSTS.WEBSERVER_URL}" target="_blank">Home</a>
             </span>
         </div>
         <br><br><br>

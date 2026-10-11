@@ -3,6 +3,7 @@ import os
 import subprocess
 import pandas as pd
 from Bio import SeqIO
+import re
 
 RUN_WITH_CONDA = False
 E_VALUE_CUT_OFF = 1e-10
@@ -15,8 +16,21 @@ COLUMN_NAMES = [
     'query_coverage_percentage', 'target_start', 'target_end', 'e_value', 'bit_score'
 ]
 
-HEADERS = HEADERS = ["T4SS Protein", "T4SS Hit Annotation", "Bacterial Protein ID"]
+HEADERS = HEADERS = ["T4SS Protein", "T4SS Hit Annotation", "Bacterial Locus Tag"]
 
+def normalize_protein_id(protein_id):
+    if "|ref|" in protein_id:
+        return protein_id.split("|ref|")[1].split("|")[0]
+    return protein_id
+
+def extract_component_name(annotation):
+    matches = re.findall(
+        r'(?:Icm|Dot|Lvg)[A-Za-z0-9]+(?:/(?:Icm|Dot|Lvg)[A-Za-z0-9]+)?',
+        annotation
+    )
+    if matches:
+        return matches[-1]
+    return annotation
 
 def run_mmseqs(query_fasta, output_mmseqs, bacterial_proteome, tmp_mmseqs, threads=1):
     mmseqs_command = (
@@ -55,7 +69,7 @@ def get_best_hits_dictionary(mmseqs_results_file):
     ]
 
     for _, row in filtered_df.iterrows():
-        T4SS_protein = row['T4SS_protein']
+        T4SS_protein = normalize_protein_id(row['T4SS_protein'])
         bacterial_protein = row['bacterial_protein']
         bit_score = row['bit_score']
 
@@ -75,13 +89,16 @@ def build_full_results_dict(T4SS_fasta, best_hits_dict):
     full_results_dict = {}
 
     for rec in SeqIO.parse(T4SS_fasta, "fasta"):
-        protein_id = rec.id
+        protein_id = normalize_protein_id(rec.id)
 
         # remove the accession from the full FASTA header and "MULTISPECIES:" if existst
-        annotation = rec.description.replace(protein_id, "", 1).strip().replace("MULTISPECIES:", "").strip()
+        annotation = rec.description.replace(rec.id, "", 1).strip()
+        annotation = annotation.replace("MULTISPECIES:", "").strip()
 
-        if "[" in annotation and "]" in annotation:
+        if "[" in annotation:
             annotation = annotation.split("[")[0].strip()
+
+        annotation = extract_component_name(annotation)
 
         if protein_id in best_hits_dict:
             bacterial_protein = best_hits_dict[protein_id][0]
